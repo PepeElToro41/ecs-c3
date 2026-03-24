@@ -1,6 +1,9 @@
+module entity_index;
 import std::collections::list;
 import std::collections::range;
+import std::core::mem::allocator;
 import std::math;
+import std::io;
 import archetype;
 
 alias Entity = ulong;
@@ -78,6 +81,10 @@ fn bool EntityPage.empty(&self) @inline {
 	return self.records == null;
 }
 
+fn void free_page(EntityPage* self, Allocator allocator) {
+   allocator::free(allocator, self.records);
+}
+
 struct EntityIndex {
 	Allocator allocator;
 
@@ -88,19 +95,25 @@ struct EntityIndex {
 	bool use_range;
 
 	uint alive_count;
-	uint entity_count;
+	uint next_entity;
 }
 
 fn EntityPage* get_page(EntityIndex* self, uint page_index) {
 	if (page_index < self.sparse_pages.len()) {
 		EntityPage *page = &self.sparse_pages[page_index];
+		return page; 
+	}
+	return null;
+}
+
+fn EntityPage* get_valid_page(EntityIndex* self, uint page_index) {
+	if (page_index < self.sparse_pages.len()) {
+		EntityPage *page = &self.sparse_pages[page_index];
     	if (page.empty()) {
         	return null;
     	}
-
 		return page; 
 	}
-
 	return null;
 }
  
@@ -153,19 +166,21 @@ fn void dense_swap_delete(EntityIndex* self, Entity entity, EntityRecord* record
 	usz dense = record.dense;
 	Entity last_alive = self.dense_list[self.alive_count];
 	Entity? last = self.dense_list.pop();
-
 	if(catch last) unreachable("entity dense list is empty");
 
 	if(entity != last_alive) {
 		self.dense_list[dense] = last_alive;
-
+   
 		EntityRecord* swapped_record = self.entity_record_ensure(last_alive);
 		swapped_record.dense = dense;
 	}
 
-	self.dense_list[self.alive_count] = last;
-	EntityRecord* last_record = self.entity_record_ensure(last);
-	last_record.dense = self.alive_count;
+   
+   if (last != last_alive) {
+      self.dense_list[self.alive_count] = last;
+      EntityRecord* last_record = self.entity_record_ensure(last);
+      last_record.dense = self.alive_count;
+   }
 	
 	record.dense = 0;
 	self.alive_count--;
@@ -175,7 +190,7 @@ fn EntityRecord* EntityIndex.entity_record_get(&self, Entity entity) {
 	EntityId entity_id = entity_id_low(entity);
 	uint page_index = get_page_index(entity_id);
 
-	EntityPage* page = get_page(self, page_index);
+	EntityPage* page = get_valid_page(self, page_index);
 	if (!page) {
 		return null;
 	}
@@ -198,13 +213,18 @@ fn EntityRecord* EntityIndex.entity_record_ensure(&self, Entity entity) {
 fn void EntityIndex.init(&self, Allocator allocator) {
 	self.allocator = allocator;
 	self.dense_list.init(allocator);
+   self.next_entity = 1;
+   self.alive_count = 0;
+   self.use_range = false;
 
 	// sparse arrays will point to zero when the id doesn't exist
 	// this means that dense array is one-indexed (lesgoooo :D)
 	self.dense_list.push(0);
 }
 
-fn Entity EntityIndex.new_entity(&self) {
+faultdef ENTITY_OUT_OF_RANGE;
+
+fn Entity? EntityIndex.new_entity(&self) {
 	if (self.alive_count < self.dense_list.len() - 1) {
 		// available dead entity, reuse it
 		self.alive_count++;
@@ -212,17 +232,21 @@ fn Entity EntityIndex.new_entity(&self) {
 	}
 
 	// create a new entity
-	Entity next_entity = self.entity_count++;
+	Entity next_entity = self.next_entity++;
 
 	if (self.use_range) {
 		bool in_range = self.entity_range.contains(entity_id_low(next_entity));
-		assert(in_range, "entity is outside of range");
-		return 0;
+
+      if (!in_range) {
+         return ENTITY_OUT_OF_RANGE~;
+      }
 	}
 
 	EntityId next_id = entity_id_low(next_entity);
 	self.dense_list.push(next_id);
-	usz dense = self.alive_count++;
+
+   self.alive_count++;
+	usz dense = self.alive_count;
 
 	EntityRecord new_record = {
 		.archetype = null,
@@ -250,7 +274,8 @@ fn void EntityIndex.make_alive(&self, Entity entity) {
 			return;
 		}
 		
-		usz dead_dense = self.alive_count++;
+      self.alive_count++;
+		usz dead_dense = self.alive_count;
 		if (dense == dead_dense) {
 			// entity is the next one to be alive
 			// incrementing alive count makes it alive
@@ -269,16 +294,25 @@ fn void EntityIndex.make_alive(&self, Entity entity) {
 		dead_record.dense = dense;
 		record.dense = dead_dense;
 	} else {
+      if (self.alive_count == self.dense_list.len() - 1) {
+         // no more dead entities, pushing the new entity
+         self.dense_list.push(entity);
+         self.alive_count++;
+         usz dead_dense = self.alive_count;
+         record.dense = dead_dense;
+      } else {
 		// pushing first dead entity at the end, and replacing it with the new entity
-		usz dead_dense = self.alive_count++;
-		Entity first_dead = self.dense_list[dead_dense];
+         self.alive_count++;
+         usz dead_dense = self.alive_count;
+         Entity first_dead = self.dense_list[dead_dense];
 
-		self.dense_list.push(first_dead);
-		self.dense_list[dead_dense] = entity;
+         self.dense_list.push(first_dead);
+         self.dense_list[dead_dense] = entity;
 
-		EntityRecord* dead_record = self.entity_record_ensure(first_dead);
-		dead_record.dense = self.dense_list.len() - 1;
-		record.dense = dead_dense;
+         EntityRecord* dead_record = self.entity_record_ensure(first_dead);
+         dead_record.dense = self.dense_list.len() - 1;
+         record.dense = dead_dense;
+      }
 	}
 }
 
@@ -287,8 +321,19 @@ fn void EntityIndex.set_range(&self, uint range_min, uint range_max) {
 	self.entity_range = range;
 	self.use_range = true;
 
-	self.entity_count = max(self.entity_count, range_min);
+
+	self.next_entity = max(self.next_entity, range_min);
 }
+
+fn void EntityIndex.free(&self) {
+   self.dense_list.free();
+
+   foreach (page : self.sparse_pages) {
+      free_page(&page, self.allocator);
+   }
+
+   self.sparse_pages.free();
+} 
 
 
 fn void EntityIndex.delete_entity(&self, Entity id, EntityRecord* record) {
