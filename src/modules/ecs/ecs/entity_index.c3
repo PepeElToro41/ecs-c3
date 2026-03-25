@@ -1,29 +1,43 @@
-module entity_index;
+module ecs::entity_index;
+
 import std::collections::list;
 import std::collections::range;
-import std::core::mem::allocator;
+import std::core::mem;
 import std::math;
 import std::io;
-import archetype;
 
-alias Entity = ulong;
-alias EntityId = uint;
+import ecs::entity;
+import ecs::archetype;
 
 const ulong ENTITY_BITS = uint.sizeof * 8;
 const ulong ENTITY_MASK = uint.max;
 const ulong GENERATION_MASK = uint.max;
+
 const uint ENTITY_PAGE_BITS = 10;
 const uint ENTITY_PAGE_SIZE = 1 << ENTITY_PAGE_BITS;
 const uint ENTITY_PAGE_MASK = ENTITY_PAGE_SIZE - 1;
 
 struct EntityRecord {
 	Archetype* archetype;
-	usz archetype_row;
-	usz dense;
+	ulong archetype_row;
+	ulong dense;
 }
 
 struct EntityPage {
 	EntityRecord[ENTITY_PAGE_SIZE]* records;
+}
+
+struct EntityIndex {
+	Allocator allocator;
+
+	List{EntityPage} sparse_pages;
+	List{Entity} dense_list;
+
+	Range{uint} entity_range;
+	bool use_range;
+
+	uint alive_count;
+	uint next_entity;
 }
 
 macro entity_id_low(id) {
@@ -62,7 +76,7 @@ fn Entity increment_generation(Entity id) {
 }
 
 fn EntityPage alloc_page(Allocator allocator) {
-	EntityRecord[ENTITY_PAGE_SIZE]* records = allocator::calloc(allocator, EntityRecord.sizeof * ENTITY_PAGE_SIZE);
+	EntityRecord[ENTITY_PAGE_SIZE]* records = mem::allocator::calloc(allocator, EntityRecord.sizeof * ENTITY_PAGE_SIZE);
 
 	EntityPage page = {
 		.records = records,
@@ -82,20 +96,7 @@ fn bool EntityPage.empty(&self) @inline {
 }
 
 fn void free_page(EntityPage* self, Allocator allocator) {
-   allocator::free(allocator, self.records);
-}
-
-struct EntityIndex {
-	Allocator allocator;
-
-	List{EntityPage} sparse_pages;
-	List{Entity} dense_list;
-
-	Range{uint} entity_range;
-	bool use_range;
-
-	uint alive_count;
-	uint next_entity;
+   mem::allocator::free(allocator, self.records);
 }
 
 fn EntityPage* get_page(EntityIndex* self, uint page_index) {
@@ -176,11 +177,11 @@ fn void dense_swap_delete(EntityIndex* self, Entity entity, EntityRecord* record
 	}
 
    
-   if (last != last_alive) {
-      self.dense_list[self.alive_count] = last;
-      EntityRecord* last_record = self.entity_record_ensure(last);
-      last_record.dense = self.alive_count;
-   }
+   	if (last != last_alive) {
+      	self.dense_list[self.alive_count] = last;
+      	EntityRecord* last_record = self.entity_record_ensure(last);
+      	last_record.dense = self.alive_count;
+   	}
 	
 	record.dense = 0;
 	self.alive_count--;
@@ -213,9 +214,9 @@ fn EntityRecord* EntityIndex.entity_record_ensure(&self, Entity entity) {
 fn void EntityIndex.init(&self, Allocator allocator) {
 	self.allocator = allocator;
 	self.dense_list.init(allocator);
-   self.next_entity = 1;
-   self.alive_count = 0;
-   self.use_range = false;
+	self.next_entity = 1;
+	self.alive_count = 0;
+	self.use_range = false;
 
 	// sparse arrays will point to zero when the id doesn't exist
 	// this means that dense array is one-indexed (lesgoooo :D)
@@ -233,19 +234,19 @@ fn Entity? EntityIndex.new_entity(&self) {
 
 	// create a new entity
 	Entity next_entity = self.next_entity++;
+	self.dense_list.push(next_entity);
 
 	if (self.use_range) {
 		bool in_range = self.entity_range.contains(entity_id_low(next_entity));
 
-      if (!in_range) {
-         return ENTITY_OUT_OF_RANGE~;
-      }
+      	if (!in_range) {
+         	return ENTITY_OUT_OF_RANGE~;
+      	}
 	}
 
 	EntityId next_id = entity_id_low(next_entity);
-	self.dense_list.push(next_id);
 
-   self.alive_count++;
+	self.alive_count++;
 	usz dense = self.alive_count;
 
 	EntityRecord new_record = {
@@ -254,8 +255,8 @@ fn Entity? EntityIndex.new_entity(&self) {
 		.dense = dense,
 	};
 	
-	EntityPage page = ensure_page(self, get_page_index((uint)next_id));
-	usz page_offset = get_page_offset((uint)next_id);
+	EntityPage page = ensure_page(self, get_page_index(next_id));
+	usz page_offset = get_page_offset(next_id);
 	
 	page.records.[page_offset] = new_record;
 	return next_id;
@@ -274,7 +275,7 @@ fn void EntityIndex.make_alive(&self, Entity entity) {
 			return;
 		}
 		
-      self.alive_count++;
+    	self.alive_count++;
 		usz dead_dense = self.alive_count;
 		if (dense == dead_dense) {
 			// entity is the next one to be alive
@@ -294,25 +295,25 @@ fn void EntityIndex.make_alive(&self, Entity entity) {
 		dead_record.dense = dense;
 		record.dense = dead_dense;
 	} else {
-      if (self.alive_count == self.dense_list.len() - 1) {
-         // no more dead entities, pushing the new entity
-         self.dense_list.push(entity);
-         self.alive_count++;
-         usz dead_dense = self.alive_count;
-         record.dense = dead_dense;
-      } else {
-		// pushing first dead entity at the end, and replacing it with the new entity
-         self.alive_count++;
-         usz dead_dense = self.alive_count;
-         Entity first_dead = self.dense_list[dead_dense];
+		if (self.alive_count == self.dense_list.len() - 1) {
+			// no more dead entities, pushing the new entity
+			self.dense_list.push(entity);
+			self.alive_count++;
+			usz dead_dense = self.alive_count;
+			record.dense = dead_dense;
+		} else {
+			// pushing first dead entity at the end, and replacing it with the new entity
+			self.alive_count++;
+			usz dead_dense = self.alive_count;
+			Entity first_dead = self.dense_list[dead_dense];
 
-         self.dense_list.push(first_dead);
-         self.dense_list[dead_dense] = entity;
+			self.dense_list.push(first_dead);
+			self.dense_list[dead_dense] = entity;
 
-         EntityRecord* dead_record = self.entity_record_ensure(first_dead);
-         dead_record.dense = self.dense_list.len() - 1;
-         record.dense = dead_dense;
-      }
+			EntityRecord* dead_record = self.entity_record_ensure(first_dead);
+			dead_record.dense = self.dense_list.len() - 1;
+			record.dense = dead_dense;
+		}
 	}
 }
 
@@ -326,13 +327,13 @@ fn void EntityIndex.set_range(&self, uint range_min, uint range_max) {
 }
 
 fn void EntityIndex.free(&self) {
-   self.dense_list.free();
+	self.dense_list.free();
 
-   foreach (page : self.sparse_pages) {
-      free_page(&page, self.allocator);
-   }
+   	foreach (page : self.sparse_pages) {
+    	free_page(&page, self.allocator);
+   	}
 
-   self.sparse_pages.free();
+	self.sparse_pages.free();
 } 
 
 

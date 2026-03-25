@@ -1,4 +1,4 @@
-module sparse_list<Type>;
+module sparse_list_old<Type>;
 import std::collections::list;
 import std::core::mem::allocator;
 
@@ -178,6 +178,7 @@ fn ulong SparseList.get_full_id(&self, uint sparse_id) {
 
 
 fn void SparseList.create_id(&self) {
+
 }
 
 fn void SparseList.delete_id(&self, ulong id) {}
