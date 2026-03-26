@@ -1,6 +1,9 @@
-module sparse_list<Type>;
+module ecs::sparse_list<Type>;
+
 import std::collections::list;
 import std::core::mem;
+
+import builtin;
 
 const ulong ELEMENT_BITS = uint.sizeof * 8;
 const ulong ELEMENT_MASK = uint.max;
@@ -12,6 +15,8 @@ const ulong PAGE_MASK = PAGE_SIZE - 1;
 
 const ulong DATA_SIZE = Type.sizeof * PAGE_SIZE;
 const ulong DENSE_SIZE = uint.sizeof * PAGE_SIZE;
+
+alias NullablePage = NullablePtr{SparsePage};
 
 struct SparsePage {
 	ulong* dense; // pointer to an array of dense offsets
@@ -87,7 +92,7 @@ struct SparseList {
 }
 
 
-fn SparsePage* SparseList.get_page(&self, uint page_index) {
+fn NullablePage SparseList.get_page(&self, uint page_index) {
 	if(page_index < self.sparse_pages.len()) {
 		SparsePage* page = &self.sparse_pages[page_index];
 		return page;
@@ -95,7 +100,7 @@ fn SparsePage* SparseList.get_page(&self, uint page_index) {
 	return null;
 }
 
-fn SparsePage* SparseList.get_valid_page(&self, uint page_index) {
+fn NullablePage SparseList.get_valid_page(&self, uint page_index) {
 	if(page_index < self.sparse_pages.len()) {
 		SparsePage* page = &self.sparse_pages[page_index];
 		if(page.empty()) {

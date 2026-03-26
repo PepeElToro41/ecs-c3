@@ -1,12 +1,13 @@
 module ecs::entity_index;
 
+import builtin;
 import std::collections::list;
 import std::collections::range;
 import std::core::mem;
 import std::math;
 import std::io;
 
-import ecs::entity;
+import ecs::types;
 import ecs::archetype;
 
 const ulong ENTITY_BITS = uint.sizeof * 8;
@@ -20,7 +21,9 @@ const uint ENTITY_PAGE_MASK = ENTITY_PAGE_SIZE - 1;
 struct EntityRecord {
 	Archetype* archetype;
 	ulong archetype_row;
+	
 	ulong dense;
+	bool deleting;
 }
 
 struct EntityPage {
@@ -39,6 +42,8 @@ struct EntityIndex {
 	uint alive_count;
 	uint next_entity;
 }
+
+alias NullablePage = NullablePtr{EntityPage};
 
 macro entity_id_low(id) {
 	return (uint)id;
@@ -99,7 +104,7 @@ fn void free_page(EntityPage* self, Allocator allocator) {
    mem::allocator::free(allocator, self.records);
 }
 
-fn EntityPage* get_page(EntityIndex* self, uint page_index) {
+fn NullablePage get_page(EntityIndex* self, uint page_index) {
 	if (page_index < self.sparse_pages.len()) {
 		EntityPage *page = &self.sparse_pages[page_index];
 		return page; 
@@ -107,9 +112,9 @@ fn EntityPage* get_page(EntityIndex* self, uint page_index) {
 	return null;
 }
 
-fn EntityPage* get_valid_page(EntityIndex* self, uint page_index) {
+fn NullablePage get_valid_page(EntityIndex* self, uint page_index) {
 	if (page_index < self.sparse_pages.len()) {
-		EntityPage *page = &self.sparse_pages[page_index];
+		EntityPage* page = &self.sparse_pages[page_index];
     	if (page.empty()) {
         	return null;
     	}
@@ -191,7 +196,7 @@ fn EntityRecord* EntityIndex.entity_record_get(&self, Entity entity) {
 	EntityId entity_id = entity_id_low(entity);
 	uint page_index = get_page_index(entity_id);
 
-	EntityPage* page = get_valid_page(self, page_index);
+	NullablePage page = get_valid_page(self, page_index);
 	if (!page) {
 		return null;
 	}

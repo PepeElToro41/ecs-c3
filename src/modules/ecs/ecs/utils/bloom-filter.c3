@@ -28,17 +28,8 @@ fn void BloomFilter.add(&self, ulong element) {
 	self.filter_bitset |= ((ulong)1 << bit2);
 }
 
-
-fn bool BloomFilter.test_filter(&self, BloomFilter filter) @inline {
-	ulong bitset = filter.filter_bitset;
+fn bool BloomFilter.test(&self, BloomFilter other) @inline {
+	ulong bitset = other.filter_bitset;
 	return (self.filter_bitset & bitset) == bitset;
-}
-
-
-fn bool BloomFilter.test_element(&self, ulong element) @inline {
-	BloomFilter filter;
-	filter.add(element);
-
-	return self.test_filter(filter);
 }
 
