@@ -37,6 +37,10 @@ fn bool ArchetypeType.equals(&self, ArchetypeType other) @operator(==) {
 	return true;
 }
 
+fn void ArchetypeType.free(&self) {
+	self.components.free();
+}
+
 fn ArchetypeType ArchetypeType.clone(&self, Allocator allocator, uint reserve = 0) {
 	List{Component} cloned_components;
 	cloned_components.init(allocator, self.components.len() + reserve);

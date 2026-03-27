@@ -1,6 +1,6 @@
 module ecs::entity_index;
 
-import builtin;
+import helpers;
 import std::collections::list;
 import std::collections::range;
 import std::core::mem;
@@ -10,9 +10,13 @@ import std::io;
 import ecs::types;
 import ecs::archetype;
 
-const ulong ENTITY_BITS = uint.sizeof * 8;
-const ulong ENTITY_MASK = uint.max;
-const ulong GENERATION_MASK = uint.max;
+const ulong ENTITY_BITS = 32;
+const ulong ENTITY_SIZE = 1ul << ENTITY_BITS;
+const ulong ENTITY_MASK = ENTITY_SIZE - 1;
+
+const ulong GENERATION_BITS = 16;
+const ulong GENERATION_SIZE = 1 << GENERATION_BITS;
+const ulong GENERATION_MASK = (GENERATION_SIZE - 1) << ENTITY_BITS;
 
 const uint ENTITY_PAGE_BITS = 10;
 const uint ENTITY_PAGE_SIZE = 1 << ENTITY_PAGE_BITS;
@@ -36,17 +40,16 @@ struct EntityIndex {
 	List{EntityPage} sparse_pages;
 	List{Entity} dense_list;
 
-	Range{uint} entity_range;
+	Range{ulong} entity_range;
 	bool use_range;
 
 	uint alive_count;
-	uint next_entity;
+	ulong next_entity;
 }
 
-alias NullablePage = NullablePtr{EntityPage};
 
 macro entity_id_low(id) {
-	return (uint)id;
+	return id & ENTITY_MASK;
 }
 
 macro entity_generation(id) {
@@ -58,7 +61,7 @@ macro append_generation(ulong id, ulong generation) {
 }
 
 macro get_page_index(id) {
-	return id >> ENTITY_PAGE_BITS;
+	return (uint)(id >> ENTITY_PAGE_BITS);
 }
 
 macro get_page_offset(id) {
@@ -67,10 +70,10 @@ macro get_page_offset(id) {
 
 fn Entity increment_generation(Entity id) {
 	if (id > ENTITY_MASK) {
-		EntityId entity_id = entity_id_low(id);
+		EntityLow entity_id = entity_id_low(id);
 		Entity new_generation = entity_generation(id) + 1;
 
-		if(new_generation > GENERATION_MASK) {
+		if(new_generation > GENERATION_SIZE) {
 			return append_generation(entity_id, 1);
 		}
 
@@ -101,26 +104,26 @@ fn bool EntityPage.empty(&self) @inline {
 }
 
 fn void free_page(EntityPage* self, Allocator allocator) {
-   mem::allocator::free(allocator, self.records);
+   	mem::allocator::free(allocator, self.records);
 }
 
-fn NullablePage get_page(EntityIndex* self, uint page_index) {
+fn EntityPage? get_page(EntityIndex* self, uint page_index) {
 	if (page_index < self.sparse_pages.len()) {
-		EntityPage *page = &self.sparse_pages[page_index];
-		return page; 
+		EntityPage page = self.sparse_pages[page_index];
+		return page;
 	}
-	return null;
+	return NOT_FOUND~;
 }
 
-fn NullablePage get_valid_page(EntityIndex* self, uint page_index) {
+fn EntityPage? get_valid_page(EntityIndex* self, uint page_index) {
 	if (page_index < self.sparse_pages.len()) {
-		EntityPage* page = &self.sparse_pages[page_index];
+		EntityPage page = self.sparse_pages[page_index];
     	if (page.empty()) {
-        	return null;
+        	return NOT_FOUND~;
     	}
 		return page; 
 	}
-	return null;
+	return NOT_FOUND~;
 }
  
 fn EntityPage ensure_page(EntityIndex* self, uint page_index) {
@@ -162,7 +165,11 @@ fn void dense_swap_recycle(EntityIndex* self, Entity entity, EntityRecord* recor
 		self.dense_list[alive_count] = increment_generation(entity);
 
 		record.dense = alive_count;
-		EntityRecord* swapped_record = self.entity_record_get(last_alive);
+		EntityRecord*? swapped_record = self.entity_record_get(last_alive);
+
+      if (catch swapped_record) {
+         unreachable("cannot get entity record");
+      }
 		swapped_record.dense = dense;
 	}
 	self.alive_count--;
@@ -192,22 +199,36 @@ fn void dense_swap_delete(EntityIndex* self, Entity entity, EntityRecord* record
 	self.alive_count--;
 }
 
-fn EntityRecord* EntityIndex.entity_record_get(&self, Entity entity) {
-	EntityId entity_id = entity_id_low(entity);
+fn EntityRecord*? EntityIndex.entity_record_get(&self, Entity entity) {
+	EntityLow entity_id = entity_id_low(entity);
 	uint page_index = get_page_index(entity_id);
 
-	NullablePage page = get_valid_page(self, page_index);
-	if (!page) {
-		return null;
-	}
+	EntityPage page = get_valid_page(self, page_index)!;
 
 	usz page_offset = get_page_offset(entity_id);
 	EntityRecord* record = &page.records.[page_offset];
 	return record;
 }
 
+faultdef ENTITY_IS_DEAD;
+faultdef MISMATCH_GENERATION;
+
+fn EntityRecord*? EntityIndex.entity_record_get_alive(&self, Entity entity) {
+   	EntityRecord* entity_record = self.entity_record_get(entity)!;
+   	if (entity_record.dense == 0) {
+      return ENTITY_IS_DEAD~;
+   	}
+
+   	Entity alive = self.dense_list[entity_record.dense];
+   	if (entity != alive) {
+    	return MISMATCH_GENERATION~;
+   	}
+
+   return entity_record;
+}
+
 fn EntityRecord* EntityIndex.entity_record_ensure(&self, Entity entity) {
-	EntityId entity_id = entity_id_low(entity);
+	EntityLow entity_id = entity_id_low(entity);
 	uint page_index = get_page_index(entity_id);
 	usz page_offset = get_page_offset(entity_id);
 
@@ -249,7 +270,7 @@ fn Entity? EntityIndex.new_entity(&self) {
       	}
 	}
 
-	EntityId next_id = entity_id_low(next_entity);
+	EntityLow next_id = entity_id_low(next_entity);
 
 	self.alive_count++;
 	usz dense = self.alive_count;
@@ -322,8 +343,8 @@ fn void EntityIndex.make_alive(&self, Entity entity) {
 	}
 }
 
-fn void EntityIndex.set_range(&self, uint range_min, uint range_max) {
-	Range{uint} range = { range_min, range_max };
+fn void EntityIndex.set_range(&self, ulong range_min, ulong range_max) {
+	Range{ulong} range = { range_min, range_max };
 	self.entity_range = range;
 	self.use_range = true;
 
@@ -339,11 +360,20 @@ fn void EntityIndex.free(&self) {
    	}
 
 	self.sparse_pages.free();
-} 
+}
+
+fn Entity? EntityIndex.get_entity_alive(&self, EntityLow entity) {
+	EntityRecord* record = self.entity_record_get(entity)!;
+	if(record.dense == 0) {
+		return NOT_FOUND~;
+	}
+
+	return self.dense_list[record.dense];
+}
 
 
-fn void EntityIndex.delete_entity(&self, Entity id, EntityRecord* record) {
-	EntityId entity_id = (uint)entity_id_low(id);
+fn void EntityIndex.delete_entity(&self, Entity entity, EntityRecord* record) {
+	EntityLow entity_id = entity_id_low(entity);
 	usz dense_index = record.dense;
 	if (dense_index == 0) {
 		return;
@@ -351,8 +381,8 @@ fn void EntityIndex.delete_entity(&self, Entity id, EntityRecord* record) {
 
 	if (self.use_range && !self.entity_range.contains(entity_id) ) {
 		// entity is not in range, do not reuse
-		dense_swap_delete(self, id, record);
+		dense_swap_delete(self, entity, record);
 	} else {
-		dense_swap_recycle(self, id, record);
+		dense_swap_recycle(self, entity, record);
 	}
 }

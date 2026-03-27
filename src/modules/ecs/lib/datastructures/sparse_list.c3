@@ -3,11 +3,14 @@ module ecs::sparse_list<Type>;
 import std::collections::list;
 import std::core::mem;
 
-import builtin;
+import helpers;
 
 const ulong ELEMENT_BITS = uint.sizeof * 8;
 const ulong ELEMENT_MASK = uint.max;
-const ulong GENERATION_MASK = uint.max;
+
+const ulong GENERATION_BITS = 16;
+const ulong GENERATION_SIZE = 1 << GENERATION_BITS;
+const ulong GENERATION_MASK = (GENERATION_SIZE - 1) << ELEMENT_BITS;
 
 const ulong PAGE_BITS = 6;
 const ulong PAGE_SIZE = 1 << PAGE_BITS;
@@ -16,11 +19,9 @@ const ulong PAGE_MASK = PAGE_SIZE - 1;
 const ulong DATA_SIZE = Type.sizeof * PAGE_SIZE;
 const ulong DENSE_SIZE = uint.sizeof * PAGE_SIZE;
 
-alias NullablePage = NullablePtr{SparsePage};
-
 struct SparsePage {
-	ulong* dense; // pointer to an array of dense offsets
-	Type* data; // pointer to data array
+	ArrayPtr{ulong} dense; // dense index array
+	ArrayPtr{Type} data; // data array
 }
 
 macro element_id_low(id) {
@@ -48,7 +49,7 @@ fn ulong increment_generation(ulong element) {
 		uint element_id = element_id_low(element);
 		ulong new_generation = element_generation(element) + 1;
 
-		if(new_generation > GENERATION_MASK) {
+		if(new_generation >= GENERATION_SIZE) {
 			return append_generation(element_id, 1);
 		}
 
@@ -59,8 +60,8 @@ fn ulong increment_generation(ulong element) {
 }
 
 fn SparsePage alloc_page(Allocator allocator) {
-	ulong* dense = mem::allocator::calloc(allocator, DENSE_SIZE);
-	Type* data = mem::allocator::calloc(allocator, DATA_SIZE);
+	ArrayPtr{ulong} dense = mem::allocator::calloc(allocator, DENSE_SIZE);
+	ArrayPtr{Type} data = mem::allocator::calloc(allocator, DATA_SIZE);
 
 	SparsePage page = {
 		.dense = dense,
@@ -92,23 +93,23 @@ struct SparseList {
 }
 
 
-fn NullablePage SparseList.get_page(&self, uint page_index) {
+fn SparsePage? SparseList.get_page(&self, uint page_index) {
 	if(page_index < self.sparse_pages.len()) {
-		SparsePage* page = &self.sparse_pages[page_index];
+		SparsePage page = self.sparse_pages[page_index];
 		return page;
 	}
-	return null;
+	return NOT_FOUND~;
 }
 
-fn NullablePage SparseList.get_valid_page(&self, uint page_index) {
+fn SparsePage? SparseList.get_valid_page(&self, uint page_index) {
 	if(page_index < self.sparse_pages.len()) {
-		SparsePage* page = &self.sparse_pages[page_index];
+		SparsePage page = self.sparse_pages[page_index];
 		if(page.empty()) {
-			return null;
+			return NOT_FOUND~;
 		}
 		return page;
 	}
-	return null;
+	return NOT_FOUND~;
 }
 
 fn SparsePage ensure_page(SparseList* self, uint page_index) {
@@ -162,7 +163,7 @@ fn Type* SparseList.new_element(&self, Type template) {
 		usz page_offset = get_page_offset(element_id);
   
 		SparsePage page = ensure_page(self, page_index);
-
+ 
 		page.data[page_offset] = template;
 		page.dense[page_offset] = dense;
 		return &page.data[page_offset];
