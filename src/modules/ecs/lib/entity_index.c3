@@ -103,9 +103,6 @@ fn bool EntityPage.empty(&self) @inline {
 	return self.records == null;
 }
 
-fn void free_page(EntityPage* self, Allocator allocator) {
-   	mem::allocator::free(allocator, self.records);
-}
 
 fn EntityPage? get_page(EntityIndex* self, uint page_index) {
 	if (page_index < self.sparse_pages.len()) {
@@ -214,17 +211,17 @@ faultdef ENTITY_IS_DEAD;
 faultdef MISMATCH_GENERATION;
 
 fn EntityRecord*? EntityIndex.entity_record_get_alive(&self, Entity entity) {
-   	EntityRecord* entity_record = self.entity_record_get(entity)!;
-   	if (entity_record.dense == 0) {
+   	EntityRecord* record = self.entity_record_get(entity)!;
+   	if (record.dense == 0) {
       return ENTITY_IS_DEAD~;
    	}
 
-   	Entity alive = self.dense_list[entity_record.dense];
+   	Entity alive = self.dense_list[record.dense];
    	if (entity != alive) {
     	return MISMATCH_GENERATION~;
    	}
 
-   return entity_record;
+   return record;
 }
 
 fn EntityRecord* EntityIndex.entity_record_ensure(&self, Entity entity) {
@@ -356,16 +353,16 @@ fn void EntityIndex.free(&self) {
 	self.dense_list.free();
 
    	foreach (page : self.sparse_pages) {
-    	free_page(&page, self.allocator);
+		mem::allocator::free(self.allocator, page.records);
    	}
 
 	self.sparse_pages.free();
 }
 
-fn Entity? EntityIndex.get_entity_alive(&self, EntityLow entity) {
+fn Entity? EntityIndex.entity_get_alive(&self, EntityLow entity) {
 	EntityRecord* record = self.entity_record_get(entity)!;
 	if(record.dense == 0) {
-		return NOT_FOUND~;
+		return ENTITY_IS_DEAD~;
 	}
 
 	return self.dense_list[record.dense];

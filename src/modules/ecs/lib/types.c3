@@ -8,6 +8,7 @@ struct TypeInfo {
 	String name;
 }
 
+
 alias BitFlags = ulong;
 alias Entity = ulong;
 alias EntityLow = ulong;

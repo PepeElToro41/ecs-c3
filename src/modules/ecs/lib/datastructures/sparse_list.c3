@@ -17,7 +17,7 @@ const ulong PAGE_SIZE = 1 << PAGE_BITS;
 const ulong PAGE_MASK = PAGE_SIZE - 1;
 
 const ulong DATA_SIZE = Type.sizeof * PAGE_SIZE;
-const ulong DENSE_SIZE = uint.sizeof * PAGE_SIZE;
+const ulong DENSE_SIZE = ulong.sizeof * PAGE_SIZE;
 
 struct SparsePage {
 	ArrayPtr{ulong} dense; // dense index array
@@ -147,6 +147,17 @@ fn void SparseList.init(&self, Allocator allocator) {
 
 	self.alive_count = 0;
 	self.next_element = 1;
+}
+
+fn void SparseList.free(&self) {
+	self.dense_list.free();
+
+	foreach (page : self.sparse_pages) {
+		mem::allocator::free(self.allocator, page.data);
+		mem::allocator::free(self.allocator, page.dense);
+	}
+
+	self.sparse_pages.free();
 }
 
 fn Type* SparseList.new_element(&self, Type template) {

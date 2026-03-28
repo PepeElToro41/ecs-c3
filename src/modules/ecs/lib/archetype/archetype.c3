@@ -15,6 +15,7 @@ import ecs::world;
 import ecs::archetype_type;
 import ecs::component_index;
 import ecs::entity_index;
+import ecs::entity;
 
 const uint MATCH_BITMASK_SIZE = 1024;
 const uint ARCHETYPE_PREALLOCATED_SIZE = 16;
@@ -37,6 +38,8 @@ alias ArchetypeId = ulong;
 alias ArchetypeEdges = HashMap{Id, Archetype*};
 
 struct Archetype {
+	World* world;
+
 	Allocator allocator;
    	ArchetypeId archetype_id;
 	ArchetypeType archetype_type;
@@ -62,44 +65,55 @@ fn ArchetypeColumn*? Archetype.get_column(Archetype* self, Id id) @inline {
 	return self.columns_map.get(id);
 }
 
-fn void Archetype.generate_matchers(&self) {
-	BloomFilter bloom_filter;
-	BitSet{MATCH_BITMASK_SIZE} bitmask;
-
-	foreach(component : self.archetype_type.components) {
-		if(component > MATCH_BITMASK_SIZE) {
-			bloom_filter.add(component);
-		} else {
-			bitmask.set(component - 1);
-		}
-	}
-
-	self.bloom_filter = bloom_filter;
-	self.match_bitmask = bitmask;
-}
 
 fn void Archetype.init(&self, Allocator allocator) {
 	List{Component} components = self.archetype_type.components;
 	uint components_count = (uint)components.len();
+	World* world = self.world;
+
 	self.allocator = allocator;
 
 	if (components_count > 0) {
 		Entity* entities = helpers::talloc(allocator, Entity, ARCHETYPE_PREALLOCATED_SIZE);
 		ArchetypeColumn* columns = helpers::talloc(allocator, ArchetypeColumn, components_count);
 
-		// TODO: only allocate columns for components, not tags
-		// TODO: link with type_info;
-
 		foreach(index, component : components) {
-			uint type_size = 4;
-			void* column_data = helpers::malloc(allocator, (usz)(type_size * ARCHETYPE_PREALLOCATED_SIZE), 16)!!;
+			ComponentRecord* record = component_index::component_record_ensure(self.world, component);
+			record.archetype_count++;
 
-			ArchetypeColumn column = {
-				.data = column_data,
-				.type_info = null,
-			};
+			record.columns_index.set(self.archetype_id, (uint)index);
+			self.columns_index.set(component, (uint)index);
 
-			columns[index] = column;
+			if(record.flags & component_index::FLAG_IS_COMPONENT) {
+				TypeInfo* type_info = record.type_info;
+				void* column_data = helpers::malloc(allocator, (usz)(type_info.type_size * ARCHETYPE_PREALLOCATED_SIZE), type_info.alignment)!!;
+
+				ArchetypeColumn column = {
+					.data = column_data,
+					.type_info = type_info,
+				};
+
+				columns[index] = column;
+				self.columns_map.set(component, &columns[index]);
+			} else {
+				self.columns_map.set(component, null);
+			}
+
+			if(component > MATCH_BITMASK_SIZE) {
+				self.bloom_filter.add(component);
+			} else {
+				self.match_bitmask.set(component - 1);
+			}
+
+			if(entity::is_pair(component)) {
+				EntityLow relation = entity::pair_first(component);
+				EntityLow target = entity::pair_second(component);
+
+				Id relation_wildcard = entity::ecs_pair(relation, world::ECS_WILDCARD);
+				Id target_wildcard = entity::ecs_pair(world::ECS_WILDCARD, target);
+
+				ComponentRecord* relatoin_record = world.components_map.get(relation_wildcard)!!;
+			}
 		}
 
 		ArchetypeData data = {
@@ -122,7 +136,6 @@ fn void Archetype.init(&self, Allocator allocator) {
 
 		self.data = data;
 	}
-	self.generate_matchers();
 
 	self.forward_edges.init(allocator);
 	self.backwards_edges.init(allocator);
@@ -166,6 +179,7 @@ fn Archetype* archetype_create(World* world, ArchetypeType archetype_type) {
 	SparseList{Archetype}* archetype_index = &world.archetype_index;
 
 	Archetype archetype = {
+		.world = world,
 		.archetype_type = archetype_type.clone(world.allocator),
 		.alive = false,
 	};
@@ -175,17 +189,39 @@ fn Archetype* archetype_create(World* world, ArchetypeType archetype_type) {
 	Archetype* allocated_archetype = archetype_index.new_element(archetype);
 	allocated_archetype.archetype_id = archetype_index.get_latest_alive();
 
+	world.archetypes_map.set(archetype_type, allocated_archetype);
 	return allocated_archetype;
 }
 
 fn Archetype* archetype_ensure(World* world, ArchetypeType archetype_type) {
-	Archetype*? existing_archetype = world.archetypes_map.get_ref(archetype_type);
+	Archetype*? existing_archetype = world.archetypes_map.get(archetype_type);
 
 	if(try existing_archetype) {
 		return existing_archetype;
 	}
 
 	return archetype_create(world, archetype_type);
+}
+
+fn Archetype* archetype_find_swap_with(World* world, Archetype* source, Id old_id, Id new_id, uint column) {
+	Archetype*? destination = source.forward_edges.get(new_id);
+	if (try destination) return destination;
+
+	@pool() {
+		ArchetypeType destination_type = source.archetype_type.clone(tmem);
+		destination_type.components[column] = new_id;
+
+		Archetype* found_archetype = archetype_ensure(world, destination_type);
+		source.forward_edges.set(new_id, found_archetype);
+
+		Archetype*? base_archetype = source.backwards_edges.get(old_id);
+
+		if (try base_archetype) {
+			base_archetype.forward_edges.set(new_id, found_archetype);
+		}
+
+		return found_archetype;
+	};
 }
 
 fn Archetype* archetype_find_with(World* world, Archetype* source, Id id) {
@@ -270,7 +306,7 @@ fn void archetype_ensure_capacity(Allocator allocator, ArchetypeData* data, usz 
 
 
 fn void archetype_insert_entity(Archetype* archetype, Entity entity, EntityRecord* record) {
-	usz assign_row = archetype.data.count++;
+	usz assign_row = archetype.data.count;
 	archetype_ensure_capacity(archetype.allocator, &archetype.data, assign_row);
 	
 	archetype.data.entities[assign_row] = entity;
@@ -280,8 +316,30 @@ fn void archetype_insert_entity(Archetype* archetype, Entity entity, EntityRecor
 		archetype.alive = true;
 	}
 
+	archetype.data.count++;
 	record.archetype = archetype;
 	record.archetype_row = assign_row;
+}
+
+fn void archetype_delete_entity(World* world, Archetype* archetype, Entity entity, EntityRecord* record) {
+	usz row = record.archetype_row;
+	usz last_row = archetype.data.count - 1;
+
+	Entity swapped = archetype.data.entities[last_row];
+
+	if (row != last_row) {
+		EntityRecord* swapped_record = world.entity_index.entity_record_get(swapped)!!;
+		swapped_record.archetype_row = row;
+		archetype.data.entities[row] = swapped;
+	} else {
+		if(last_row == 0) {
+			archetype.alive = false;
+		}
+	}
+
+	archetype.data.count--;
+	record.archetype = world.root_archetype;
+	record.archetype_row = 0;
 }
 
 fn void archetype_move_entity(World* world, Archetype* source, Archetype* destination, Entity entity, EntityRecord* record) {
@@ -348,6 +406,10 @@ fn void archetype_move_entity(World* world, Archetype* source, Archetype* destin
 				);
 			}
 		};
+
+		if(source_row == 0) {
+			source.alive = false;
+		}
 	}
 
 	destination.data.count++;
@@ -366,4 +428,11 @@ fn void archetype_modify_column(ArchetypeColumn* column, usz row, void* data) {
 		data,
 		type_size
 	);
+}
+
+fn void* archetype_read_column(ArchetypeColumn* column, usz row) {
+	usz type_size = column.type_info.type_size;
+	char* column_data = (char*)column.data;
+
+	return &column_data[row * type_size];
 }

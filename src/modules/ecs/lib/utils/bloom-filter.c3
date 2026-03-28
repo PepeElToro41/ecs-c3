@@ -32,4 +32,3 @@ fn bool BloomFilter.test(&self, BloomFilter other) @inline {
 	ulong bitset = other.filter_bitset;
 	return (self.filter_bitset & bitset) == bitset;
 }
-
